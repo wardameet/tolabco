@@ -1,0 +1,669 @@
+require("dotenv").config();
+const express = require('express');
+const { Client } = require('pg');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+app.use(express.json());
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const cors = require("cors");
+
+app.use(helmet());
+app.use(cors());
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: { error: "Too many requests, please try again later" }
+});
+app.use(limiter);
+
+const db = new Client({ connectionString: 'postgresql://studenthub_user:Studenthub123@localhost:5432/studenthub_db' });
+db.connect();
+
+const JWT_SECRET = 'studenthub_super_secret_key_change_this_in_production';
+
+// Public test endpoint
+app.get('/test', (req, res) => {
+  res.json({ message: 'StudentHub API ready' });
+});
+
+// Register
+app.post('/register', async (req, res) => {
+  const { email, password, role, full_name, phone } = req.body;
+  if (!email || !password || !role) {
+    return res.status(400).json({ error: 'Email, password, and role are required' });
+  }
+  try {
+    const hashed = await bcrypt.hash(password, 10);
+    const userId = uuidv4();
+    await db.query(
+      'INSERT INTO users (id, email, password_hash, role, phone) VALUES ($1, $2, $3, $4, $5)',
+      [userId, email, hashed, role, phone || null]
+    );
+    if (role === 'student') {
+      await db.query('INSERT INTO students (user_id, full_name) VALUES ($1, $2)', [userId, full_name || email.split('@')[0]]);
+    } else if (role === 'employer') {
+      await db.query('INSERT INTO employers (user_id, company_name) VALUES ($1, $2)', [userId, full_name || 'Unnamed Company']);
+    }
+    res.status(201).json({ message: 'User registered', userId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// Login
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password required' });
+  }
+  try {
+    const result = await db.query('SELECT id, email, password_hash, role FROM users WHERE email = $1', [email]);
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const user = result.rows[0];
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, email: user.email, role: user.role } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Middleware to verify JWT
+function authenticate(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// Protected profile endpoint
+app.get('/profile', authenticate, async (req, res) => {
+  try {
+    const user = req.user;
+    if (user.role === 'student') {
+      const result = await db.query('SELECT full_name, date_of_birth, city, profession_category, skills, video_cv_url, cv_text, unique_link, verified FROM students WHERE user_id = $1', [user.userId]);
+      res.json({ user: { id: user.userId, email: user.email, role: user.role }, profile: result.rows[0] || {} });
+    } else if (user.role === 'employer') {
+      const result = await db.query('SELECT company_name, company_city FROM employers WHERE user_id = $1', [user.userId]);
+      res.json({ user: { id: user.userId, email: user.email, role: user.role }, profile: result.rows[0] || {} });
+    } else {
+      res.json({ user: { id: user.userId, email: user.email, role: user.role } });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch profile' });
+  }
+});
+
+// Create a job (employer only)
+app.post('/jobs', authenticate, async (req, res) => {
+  if (req.user.role !== 'employer') {
+    return res.status(403).json({ error: 'Only employers can post jobs' });
+  }
+  const { title, description, job_type, location_city, is_remote, salary_range } = req.body;
+  if (!title) {
+    return res.status(400).json({ error: 'Title is required' });
+  }
+  try {
+    const jobId = uuidv4();
+    await db.query(
+      `INSERT INTO jobs (id, employer_id, title, description, job_type, location_city, is_remote, salary_range)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [jobId, req.user.userId, title, description || null, job_type || null, location_city || null, is_remote || false, salary_range || null]
+    );
+    res.status(201).json({ message: 'Job created', jobId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create job' });
+  }
+});
+
+// List jobs (any authenticated user)
+app.get('/jobs', authenticate, async (req, res) => {
+  try {
+    const { search, job_type, location_city, is_remote, page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+    let query = `
+      SELECT j.*, e.company_name
+      FROM jobs j
+      JOIN employers e ON j.employer_id = e.user_id
+      WHERE j.is_active = true`;
+    const params = [];
+    let idx = 1;
+
+    if (search) {
+      query += ` AND (j.title ILIKE $${idx} OR j.description ILIKE $${idx})`;
+      params.push(`%${search}%`);
+      idx++;
+    }
+    if (job_type) {
+      query += ` AND j.job_type = $${idx}`;
+      params.push(job_type);
+      idx++;
+    }
+    if (location_city) {
+      query += ` AND j.location_city ILIKE $${idx}`;
+      params.push(`%${location_city}%`);
+      idx++;
+    }
+    if (is_remote !== undefined) {
+      query += ` AND j.is_remote = $${idx}`;
+      params.push(is_remote === 'true');
+      idx++;
+    }
+
+    const countQuery = query.replace('SELECT j.*, e.company_name', 'SELECT COUNT(*) as total');
+    const countResult = await db.query(countQuery, params);
+    const total = parseInt(countResult.rows[0].total);
+
+    query += ` ORDER BY j.created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`;
+    params.push(limit, offset);
+    const result = await db.query(query, params);
+
+    res.json({
+      jobs: result.rows,
+      pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / limit) }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch jobs' });
+  }
+});
+
+// ----- S3 Video CV Upload Endpoints -----
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+
+const s3Client = new S3Client({
+  region: process.env.S3_REGION,
+  endpoint: process.env.S3_ENDPOINT,
+  credentials: {
+    accessKeyId: process.env.S3_ACCESS_KEY,
+    secretAccessKey: process.env.S3_SECRET_KEY,
+  },
+  forcePathStyle: true,
+});
+
+// Generate pre-signed URL for video upload
+app.get('/get-upload-url', authenticate, async (req, res) => {
+  if (req.user.role !== 'student') {
+    return res.status(403).json({ error: 'Only students can upload videos' });
+  }
+  const extension = req.query.extension || 'mp4';
+  const key = `students/${req.user.userId}/cv.${extension}`;
+  const command = new PutObjectCommand({
+    Bucket: process.env.S3_BUCKET,
+    Key: key,
+    ContentType: 'video/mp4',
+  });
+  try {
+    const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+    res.json({ uploadUrl, key });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to generate upload URL' });
+  }
+});
+
+// Save video reference after upload
+app.post('/set-video-cv', authenticate, async (req, res) => {
+  if (req.user.role !== 'student') {
+    return res.status(403).json({ error: 'Only students can set video CV' });
+  }
+  const { key } = req.body;
+  if (!key) return res.status(400).json({ error: 'Missing video key' });
+  try {
+    const command = new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET,
+      Key: key,
+    });
+    const downloadUrl = await getSignedUrl(s3Client, command, { expiresIn: 604800 });
+    await db.query('UPDATE students SET video_cv_url = $1 WHERE user_id = $2', [downloadUrl, req.user.userId]);
+    res.json({ message: 'Video CV saved', videoUrl: downloadUrl });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save video CV' });
+  }
+});
+
+const PORT = 3001;
+app.listen(PORT, '0.0.0.0', () => console.log(`StudentHub API listening on port ${PORT}`));
+
+// Student applies to a job (student only)
+app.post('/apply/:jobId', authenticate, async (req, res) => {
+  if (req.user.role !== 'student') {
+    return res.status(403).json({ error: 'Only students can apply to jobs' });
+  }
+  const { jobId } = req.params;
+  const studentId = req.user.userId;
+  try {
+    // Check if already applied
+    const existing = await db.query('SELECT id FROM applications WHERE job_id = $1 AND student_id = $2', [jobId, studentId]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'You have already applied to this job' });
+    }
+    // Check if job exists and is active
+    const jobCheck = await db.query('SELECT id FROM jobs WHERE id = $1 AND is_active = true', [jobId]);
+    if (jobCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found or inactive' });
+    }
+    await db.query('INSERT INTO applications (job_id, student_id) VALUES ($1, $2)', [jobId, studentId]);
+    res.status(201).json({ message: 'Application submitted' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to apply' });
+  }
+});
+
+// Student views their own applications
+app.get('/my-applications', authenticate, async (req, res) => {
+  if (req.user.role !== 'student') {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  try {
+    const result = await db.query(
+      `SELECT a.*, j.title, j.location_city, j.job_type, e.company_name
+       FROM applications a
+       JOIN jobs j ON a.job_id = j.id
+       JOIN employers e ON j.employer_id = e.user_id
+       WHERE a.student_id = $1
+       ORDER BY a.applied_at DESC`,
+      [req.user.userId]
+    );
+    res.json({ applications: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch applications' });
+  }
+});
+
+// Employer views applicants for their jobs
+app.get('/employer/applications', authenticate, async (req, res) => {
+  if (req.user.role !== 'employer') {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  try {
+    const result = await db.query(
+      `SELECT a.*, j.title, j.id as job_id, s.full_name, s.user_id as student_user_id
+       FROM applications a
+       JOIN jobs j ON a.job_id = j.id
+       JOIN students s ON a.student_id = s.user_id
+       WHERE j.employer_id = $1
+       ORDER BY a.applied_at DESC`,
+      [req.user.userId]
+    );
+    res.json({ applications: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch applicants' });
+  }
+});
+
+// Update student profile (student only)
+app.put('/profile', authenticate, async (req, res) => {
+  if (req.user.role !== 'student') {
+    return res.status(403).json({ error: 'Only students can update profile' });
+  }
+  const { full_name, date_of_birth, city, profession_category, skills } = req.body;
+  try {
+    const updates = [];
+    const values = [];
+    let idx = 1;
+    if (full_name !== undefined) { updates.push(`full_name = $${idx}`); values.push(full_name); idx++; }
+    if (date_of_birth !== undefined) { updates.push(`date_of_birth = $${idx}`); values.push(date_of_birth); idx++; }
+    if (city !== undefined) { updates.push(`city = $${idx}`); values.push(city); idx++; }
+    if (profession_category !== undefined) { updates.push(`profession_category = $${idx}`); values.push(profession_category); idx++; }
+    if (skills !== undefined) { updates.push(`skills = $${idx}`); values.push(skills); idx++; }
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    values.push(req.user.userId);
+    await db.query(`UPDATE students SET ${updates.join(', ')} WHERE user_id = $${idx}`, values);
+    res.json({ message: 'Profile updated' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// Public CV page (no authentication required)
+app.get('/cv/:shortCode', async (req, res) => {
+  const { shortCode } = req.params;
+  try {
+    // First, find the student by unique_link (we'll use user_id as shortCode for now)
+    const studentResult = await db.query(
+      `SELECT s.full_name, s.city, s.profession_category, s.skills, s.video_cv_url, s.cv_text, u.email
+       FROM students s
+       JOIN users u ON s.user_id = u.id
+       WHERE s.user_id::text = $1 OR s.unique_link = $1`,
+      [shortCode]
+    );
+    if (studentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'CV not found' });
+    }
+    const student = studentResult.rows[0];
+    // For MVP, return JSON (frontend will render a nice page later)
+    res.json({ student });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch CV' });
+  }
+});
+
+// Voucher endpoints (for outlets and students)
+// Create a voucher (outlet only)
+app.post('/vouchers', authenticate, async (req, res) => {
+  if (req.user.role !== 'outlet') {
+    return res.status(403).json({ error: 'Only outlets can create vouchers' });
+  }
+  const { title, description, discount_percent, start_date, end_date, max_redemptions } = req.body;
+  if (!title || !discount_percent) {
+    return res.status(400).json({ error: 'Title and discount percent are required' });
+  }
+  try {
+    const voucherId = uuidv4();
+    await db.query(
+      `INSERT INTO vouchers (id, outlet_id, title, description, discount_percent, start_date, end_date, max_redemptions)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [voucherId, req.user.userId, title, description || null, discount_percent, start_date || null, end_date || null, max_redemptions || null]
+    );
+    res.status(201).json({ message: 'Voucher created', voucherId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create voucher' });
+  }
+});
+
+// List active vouchers (any authenticated user)
+app.get('/vouchers', authenticate, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT v.*, u.email as outlet_email
+       FROM vouchers v
+       JOIN users u ON v.outlet_id = u.id
+       WHERE v.is_active = true AND (v.end_date IS NULL OR v.end_date >= CURRENT_DATE)
+       ORDER BY v.created_at DESC`
+    );
+    res.json({ vouchers: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch vouchers' });
+  }
+});
+
+// Redeem a voucher (student only)
+app.post('/redeem/:voucherId', authenticate, async (req, res) => {
+  if (req.user.role !== 'student') {
+    return res.status(403).json({ error: 'Only students can redeem vouchers' });
+  }
+  const { voucherId } = req.params;
+  try {
+    // Check voucher exists and is active
+    const voucherCheck = await db.query('SELECT id, max_redemptions, redemption_count FROM vouchers WHERE id = $1 AND is_active = true', [voucherId]);
+    if (voucherCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Voucher not found or inactive' });
+    }
+    const voucher = voucherCheck.rows[0];
+    if (voucher.max_redemptions && voucher.redemption_count >= voucher.max_redemptions) {
+      return res.status(400).json({ error: 'Voucher redemption limit reached' });
+    }
+    // Check if student already redeemed this voucher
+    const existing = await db.query('SELECT id FROM redemptions WHERE voucher_id = $1 AND student_id = $2', [voucherId, req.user.userId]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'You have already redeemed this voucher' });
+    }
+    // Record redemption
+    await db.query('INSERT INTO redemptions (voucher_id, student_id) VALUES ($1, $2)', [voucherId, req.user.userId]);
+    await db.query('UPDATE vouchers SET redemption_count = redemption_count + 1 WHERE id = $1', [voucherId]);
+    res.json({ message: 'Voucher redeemed successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to redeem voucher' });
+  }
+});
+
+// Admin endpoints (admin only)
+// Middleware to check admin role
+function requireAdmin(req, res, next) {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+}
+
+// List all users (admin only)
+app.get('/admin/users', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, email, role, is_active, created_at FROM users ORDER BY created_at DESC`
+    );
+    res.json({ users: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// Verify a student (admin only)
+app.post('/admin/verify-student/:userId', authenticate, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
+  try {
+    await db.query('UPDATE students SET verified = true WHERE user_id = $1', [userId]);
+    res.json({ message: 'Student verified' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to verify student' });
+  }
+});
+
+// Disable a user (admin only)
+app.post('/admin/disable-user/:userId', authenticate, requireAdmin, async (req, res) => {
+  const { userId } = req.params;
+  try {
+    await db.query('UPDATE users SET is_active = false WHERE id = $1', [userId]);
+    res.json({ message: 'User disabled' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to disable user' });
+  }
+});
+
+// Get dashboard stats (admin only)
+app.get('/admin/stats', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const totalStudents = await db.query('SELECT COUNT(*) FROM students');
+    const totalEmployers = await db.query('SELECT COUNT(*) FROM employers');
+    const totalJobs = await db.query('SELECT COUNT(*) FROM jobs');
+    const totalApplications = await db.query('SELECT COUNT(*) FROM applications');
+    res.json({
+      totalStudents: parseInt(totalStudents.rows[0].count),
+      totalEmployers: parseInt(totalEmployers.rows[0].count),
+      totalJobs: parseInt(totalJobs.rows[0].count),
+      totalApplications: parseInt(totalApplications.rows[0].count),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// DeepSeek AI – Generate CV text from student profile
+const OpenAI = require('openai');
+const deepseek = new OpenAI({
+  apiKey: process.env.DEEPSEEK_API_KEY,
+  baseURL: 'https://api.deepseek.com/v1',
+});
+
+app.post('/generate-cv', authenticate, async (req, res) => {
+  if (req.user.role !== 'student') {
+    return res.status(403).json({ error: 'Only students can generate CV' });
+  }
+  const { full_name, date_of_birth, city, profession_category, skills, education, experience } = req.body;
+  if (!full_name || !skills) {
+    return res.status(400).json({ error: 'Full name and skills are required' });
+  }
+  try {
+    const prompt = `Generate a professional CV summary in English for a student named ${full_name}. 
+Skills: ${Array.isArray(skills) ? skills.join(', ') : skills}
+${profession_category ? `Category: ${profession_category}` : ''}
+${city ? `Location: ${city}` : ''}
+${education ? `Education: ${education}` : ''}
+${experience ? `Experience: ${experience}` : ''}
+Write 2-3 sentences highlighting their strengths and what they are looking for. Keep it concise.`;
+
+    const completion = await deepseek.chat.completions.create({
+      model: 'deepseek-chat',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.7,
+    });
+    const cvText = completion.choices[0].message.content;
+    await db.query('UPDATE students SET cv_text = $1 WHERE user_id = $2', [cvText, req.user.userId]);
+    res.json({ message: 'CV generated', cv_text: cvText });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'AI generation failed' });
+  }
+});
+
+// AI natural language search for students (employer only)
+app.post('/employer/search-students', authenticate, async (req, res) => {
+  if (req.user.role !== 'employer') {
+    return res.status(403).json({ error: 'Only employers can search' });
+  }
+  const { query } = req.body;
+  if (!query) return res.status(400).json({ error: 'Query is required' });
+
+  try {
+    // Use DeepSeek to parse natural language into structured filters
+    const prompt = `Extract search filters from this employer query for student profiles.
+Query: "${query}"
+Return JSON with these fields (only if mentioned, otherwise omit):
+- gender: "male" or "female"
+- min_age: number
+- max_age: number
+- degree: string (e.g., "electrical engineering")
+- city: string
+- skills: array of strings
+Example: {"gender":"female","min_age":20,"max_age":30,"degree":"electrical engineering","city":"Cairo","skills":["autocad","matlab"]}
+Only output valid JSON, no explanation.`;
+
+    const completion = await deepseek.chat.completions.create({
+      model: 'deepseek-chat',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.2,
+    });
+    const filters = JSON.parse(completion.choices[0].message.content.trim());
+    
+    // Build SQL query based on extracted filters
+    let sql = `SELECT s.user_id, s.full_name, s.city, s.profession_category, s.skills, s.video_cv_url, s.cv_text, s.verified, 
+                      u.email, EXTRACT(YEAR FROM AGE(CURRENT_DATE, s.date_of_birth)) as age
+               FROM students s
+               JOIN users u ON s.user_id = u.id
+               WHERE s.date_of_birth IS NOT NULL`;
+    const params = [];
+    let idx = 1;
+
+    if (filters.gender) {
+      // gender not stored directly, we can derive from name? Skip for MVP, but you could add a gender column.
+    }
+    if (filters.min_age) {
+      sql += ` AND EXTRACT(YEAR FROM AGE(CURRENT_DATE, s.date_of_birth)) >= $${idx++}`;
+      params.push(filters.min_age);
+    }
+    if (filters.max_age) {
+      sql += ` AND EXTRACT(YEAR FROM AGE(CURRENT_DATE, s.date_of_birth)) <= $${idx++}`;
+      params.push(filters.max_age);
+    }
+    if (filters.degree) {
+      sql += ` AND s.profession_category ILIKE $${idx++}`;
+      params.push(`%${filters.degree}%`);
+    }
+    if (filters.city) {
+      sql += ` AND s.city ILIKE $${idx++}`;
+      params.push(`%${filters.city}%`);
+    }
+    if (filters.skills && filters.skills.length) {
+      sql += ` AND s.skills && $${idx++}`;
+      params.push(filters.skills);
+    }
+    sql += ` LIMIT 20`;
+    const result = await db.query(sql, params);
+    res.json({ query, filters, results: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'AI search failed', details: err.message });
+  }
+});
+
+// Edit a job (employer only)
+app.put('/jobs/:jobId', authenticate, async (req, res) => {
+  if (req.user.role !== 'employer') {
+    return res.status(403).json({ error: 'Only employers can edit jobs' });
+  }
+  const { jobId } = req.params;
+  const { title, description, job_type, location_city, is_remote, salary_range } = req.body;
+  try {
+    // Verify job belongs to this employer
+    const ownerCheck = await db.query('SELECT id FROM jobs WHERE id = $1 AND employer_id = $2', [jobId, req.user.userId]);
+    if (ownerCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found or not owned by you' });
+    }
+    const updates = [];
+    const values = [];
+    let idx = 1;
+    if (title !== undefined) { updates.push(`title = $${idx}`); values.push(title); idx++; }
+    if (description !== undefined) { updates.push(`description = $${idx}`); values.push(description); idx++; }
+    if (job_type !== undefined) { updates.push(`job_type = $${idx}`); values.push(job_type); idx++; }
+    if (location_city !== undefined) { updates.push(`location_city = $${idx}`); values.push(location_city); idx++; }
+    if (is_remote !== undefined) { updates.push(`is_remote = $${idx}`); values.push(is_remote); idx++; }
+    if (salary_range !== undefined) { updates.push(`salary_range = $${idx}`); values.push(salary_range); idx++; }
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    values.push(jobId);
+    await db.query(`UPDATE jobs SET ${updates.join(', ')} WHERE id = $${idx}`, values);
+    res.json({ message: 'Job updated' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update job' });
+  }
+});
+
+// Delete a job (employer only)
+app.delete('/jobs/:jobId', authenticate, async (req, res) => {
+  if (req.user.role !== 'employer') {
+    return res.status(403).json({ error: 'Only employers can delete jobs' });
+  }
+  const { jobId } = req.params;
+  try {
+    const ownerCheck = await db.query('SELECT id FROM jobs WHERE id = $1 AND employer_id = $2', [jobId, req.user.userId]);
+    if (ownerCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Job not found or not owned by you' });
+    }
+    await db.query('DELETE FROM jobs WHERE id = $1', [jobId]);
+    res.json({ message: 'Job deleted' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete job' });
+  }
+});

@@ -1,0 +1,27 @@
+# Environment variables
+.env
+
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Build outputs
+frontend/dist/
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+pm2-*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Backup files
+*.backup
+*.tmp

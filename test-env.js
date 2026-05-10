@@ -1,0 +1,1 @@
+require('dotenv').config(); console.log('Access Key:', process.env.S3_ACCESS_KEY ? process.env.S3_ACCESS_KEY.slice(0,5)+'...' : 'missing'); console.log('Secret Key:', process.env.S3_SECRET_KEY ? 'present (length '+process.env.S3_SECRET_KEY.length+')' : 'missing');

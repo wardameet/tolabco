@@ -1,0 +1,312 @@
+openapi: 3.0.0
+info:
+  title: StudentHub API
+  description: Platform for Egyptian students – job matching, video CVs, AI search, discount vouchers
+  version: 1.0.0
+servers:
+  - url: https://tolabco.com
+    description: Production server
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+security:
+  - bearerAuth: []
+paths:
+  /test:
+    get:
+      summary: Test API connectivity
+      responses:
+        '200':
+          description: API ready
+  /register:
+    post:
+      summary: Register a new user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, role]
+              properties:
+                email: { type: string }
+                password: { type: string }
+                role: { type: string, enum: [student, employer, outlet] }
+                full_name: { type: string }
+                phone: { type: string }
+      responses:
+        '201': { description: User registered }
+        '400': { description: Missing fields }
+        '500': { description: Registration failed }
+  /login:
+    post:
+      summary: Login and get JWT token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string }
+                password: { type: string }
+      responses:
+        '200': { description: Returns token and user object }
+        '401': { description: Invalid credentials }
+  /profile:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: Get authenticated user profile
+      responses:
+        '200': { description: Profile data }
+        '401': { description: Unauthorized }
+    put:
+      security: [{ bearerAuth: [] }]
+      summary: Update student profile (student only)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                full_name: { type: string }
+                date_of_birth: { type: string, format: date }
+                city: { type: string }
+                profession_category: { type: string }
+                skills: { type: array, items: { type: string } }
+      responses:
+        '200': { description: Profile updated }
+        '403': { description: Only students can update }
+  /jobs:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: List jobs with search, filters, pagination
+      parameters:
+        - { name: search, in: query, schema: { type: string } }
+        - { name: job_type, in: query, schema: { type: string } }
+        - { name: location_city, in: query, schema: { type: string } }
+        - { name: is_remote, in: query, schema: { type: boolean } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 20 } }
+      responses:
+        '200': { description: Jobs with pagination }
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Create a job (employer only)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string }
+                description: { type: string }
+                job_type: { type: string }
+                location_city: { type: string }
+                is_remote: { type: boolean }
+                salary_range: { type: string }
+      responses:
+        '201': { description: Job created }
+        '403': { description: Only employers }
+    put:
+      security: [{ bearerAuth: [] }]
+      summary: Edit a job (employer only)
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                description: { type: string }
+                job_type: { type: string }
+                location_city: { type: string }
+                is_remote: { type: boolean }
+                salary_range: { type: string }
+      responses:
+        '200': { description: Job updated }
+    delete:
+      security: [{ bearerAuth: [] }]
+      summary: Delete a job (employer only)
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Job deleted }
+  /apply/{jobId}:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Apply to a job (student only)
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      responses:
+        '201': { description: Application submitted }
+        '400': { description: Already applied }
+  /my-applications:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: Student's applications (paginated)
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 10 } }
+      responses:
+        '200': { description: List of applications }
+  /employer/applications:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: Employer's applicants (paginated)
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 10 } }
+      responses:
+        '200': { description: List of applicants }
+  /get-upload-url:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: Get pre-signed URL for video upload (student only)
+      parameters:
+        - { name: extension, in: query, schema: { type: string, default: mp4 } }
+      responses:
+        '200': { description: Returns uploadUrl and key }
+  /set-video-cv:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Save video reference after upload (student only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key: { type: string }
+      responses:
+        '200': { description: Video saved }
+  /cv/{shortCode}:
+    get:
+      summary: Public CV page (no auth)
+      parameters:
+        - { name: shortCode, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Student profile with video URL }
+        '404': { description: Not found }
+  /generate-cv:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Generate CV text using DeepSeek AI (student only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [full_name, skills]
+              properties:
+                full_name: { type: string }
+                skills: { type: array, items: { type: string } }
+                profession_category: { type: string }
+                city: { type: string }
+                education: { type: string }
+                experience: { type: string }
+      responses:
+        '200': { description: CV text generated }
+  /employer/search-students:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Natural language search for students (employer only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+      responses:
+        '200': { description: Filtered student results }
+  /vouchers:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: List active vouchers
+      responses:
+        '200': { description: Vouchers list }
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Create a voucher (outlet only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, discount_percent]
+              properties:
+                title: { type: string }
+                description: { type: string }
+                discount_percent: { type: integer }
+                start_date: { type: string, format: date }
+                end_date: { type: string, format: date }
+                max_redemptions: { type: integer }
+      responses:
+        '201': { description: Voucher created }
+  /redeem/{voucherId}:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Redeem a voucher (student only)
+      parameters:
+        - { name: voucherId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Redeemed successfully }
+  /admin/users:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: List all users (admin only)
+      parameters:
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: Users list with pagination }
+  /admin/users/{userId}/disable:
+    put:
+      security: [{ bearerAuth: [] }]
+      summary: Disable a user (admin only)
+      parameters:
+        - { name: userId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: User disabled }
+  /admin/users/{userId}/enable:
+    put:
+      security: [{ bearerAuth: [] }]
+      summary: Enable a user (admin only)
+      parameters:
+        - { name: userId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: User enabled }
+  /admin/verification-queue:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: Get pending verifications (admin only)
+      responses:
+        '200': { description: List of pending students }
+  /admin/verify/{studentId}:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Approve student verification (admin only)
+      parameters:
+        - { name: studentId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Student verified }
+  /admin/stats:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: System statistics (admin only)
+      responses:
+        '200': { description: Counts of users, jobs, etc. }

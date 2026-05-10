@@ -1,0 +1,170 @@
+openapi: 3.0.0
+info:
+  title: StudentHub API
+  description: Backend for student job platform with video CVs, vouchers, and AI
+  version: 1.0.0
+servers:
+  - url: https://tolabco.com
+    description: Production server
+  - url: http://localhost:3001
+    description: Development server
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+security:
+  - bearerAuth: []
+paths:
+  /test:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: API ready
+  /register:
+    post:
+      summary: Register a new user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, role]
+              properties:
+                email: { type: string }
+                password: { type: string }
+                role: { type: string, enum: [student, employer, outlet, admin] }
+                full_name: { type: string }
+                phone: { type: string }
+      responses:
+        '201': { description: User created }
+  /login:
+    post:
+      summary: Login and get JWT token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string }
+                password: { type: string }
+      responses:
+        '200': { description: Returns token and user object }
+  /profile:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: Get current user profile
+    put:
+      security: [{ bearerAuth: [] }]
+      summary: Update student profile (student only)
+  /cv/{shortCode}:
+    get:
+      summary: Public CV page
+      parameters:
+        - name: shortCode
+          in: path
+          required: true
+          schema: { type: string }
+  /jobs:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: List jobs with search, filter, pagination
+      parameters:
+        - name: search
+          in: query
+          schema: { type: string }
+        - name: job_type
+          in: query
+          schema: { type: string, enum: [part_time, summer, internship, training] }
+        - name: location_city
+          in: query
+          schema: { type: string }
+        - name: is_remote
+          in: query
+          schema: { type: boolean }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Create a job (employer only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string }
+                description: { type: string }
+                job_type: { type: string }
+                location_city: { type: string }
+                is_remote: { type: boolean }
+                salary_range: { type: string }
+    put:
+      security: [{ bearerAuth: [] }]
+      summary: Update a job (employer only)
+    delete:
+      security: [{ bearerAuth: [] }]
+      summary: Delete a job (employer only)
+  /apply/{jobId}:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Apply to a job (student only)
+  /my-applications:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: List student applications with pagination
+  /employer/applications:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: List applicants for employer's jobs
+  /get-upload-url:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: Get pre-signed URL for video upload (student only)
+  /set-video-cv:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Save video reference after upload
+  /vouchers:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: List active vouchers
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Create voucher (outlet only)
+  /redeem/{voucherId}:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Redeem a voucher (student only)
+  /generate-cv:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Generate CV text using AI (student only)
+  /employer/search-students:
+    post:
+      security: [{ bearerAuth: [] }]
+      summary: Natural language search using AI (employer only)
+  /admin/users:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: List all users (admin only)
+  /admin/verification-queue:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: List pending verifications
+  /admin/stats:
+    get:
+      security: [{ bearerAuth: [] }]
+      summary: System statistics
